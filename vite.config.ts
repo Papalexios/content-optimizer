@@ -16,8 +16,8 @@ export default defineConfig(({ mode }) => {
       },
       resolve: {
         alias: {
-          // FIX: Use process.cwd() instead of __dirname for ES module compatibility.
-          '@': path.resolve(process.cwd()),
+// FIX: Use `path.resolve('.')` which is equivalent to `path.resolve(process.cwd())` but avoids potential type issues with the `process` global.
+          '@': path.resolve('.'),
         }
       }
     };

@@ -1,8 +1,10 @@
+
 import { GoogleGenAI, GenerateContentResponse, Type } from "@google/genai";
 import OpenAI from "openai";
 import Anthropic from "@anthropic-ai/sdk";
 import React, { useState, useMemo, useEffect, useCallback, useReducer, useRef, memo } from 'react';
 import ReactDOM from 'react-dom/client';
+import { generateFullSchema, generateSchemaMarkup } from './schema-generator';
 
 const AI_MODELS = {
     GEMINI_FLASH: 'gemini-2.5-flash',
@@ -29,87 +31,6 @@ const AI_MODELS = {
     ]
 };
 
-
-// ════════════════════════════════════════════════════════════════════════════════
-// SCHEMA MARKUP HANDLER - PREVENTS SCHEMA IN VISIBLE CONTENT
-// ════════════════════════════════════════════════════════════════════════════════
-
-function extractSchemaFromContent(contentData) {
-    const schemas = [];
-    if (!contentData.schema) return schemas;
-
-    if (contentData.schema.localBusiness) schemas.push(contentData.schema.localBusiness);
-    if (contentData.schema.article) schemas.push(contentData.schema.article);
-    if (contentData.schema.faqPage) schemas.push(contentData.schema.faqPage);
-    if (contentData.schema.videoObjects) schemas.push(...contentData.schema.videoObjects);
-    if (contentData.schema.breadcrumb) schemas.push(contentData.schema.breadcrumb);
-    if (contentData.schema.organization) schemas.push(contentData.schema.organization);
-
-    console.log(`✅ Extracted ${schemas.length} schema types`);
-    return schemas;
-}
-
-function generateSchemaMarkup(schemas) {
-    if (!schemas || schemas.length === 0) return '';
-    const schemaObject = {"@context": "https://schema.org", "@graph": schemas};
-    return `<script type="application/ld+json">\n${JSON.stringify(schemaObject, null, 2)}\n</script>`;
-}
-
-function renderCleanArticleContent(contentData) {
-    let html = '';
-
-    if (contentData.title) html += `<h1>${contentData.title}</h1>\n\n`;
-
-    if (contentData.author) {
-        html += `<div class="author-info">\n<p><strong>By ${contentData.author.name}</strong></p>\n`;
-        if (contentData.author.credentials) html += `<p>${contentData.author.credentials}</p>\n`;
-        if (contentData.author.bio) html += `<p><em>${contentData.author.bio}</em></p>\n`;
-        html += `</div>\n\n`;
-    }
-
-    if (contentData.content?.introduction) html += contentData.content.introduction + '\n\n';
-
-    if (contentData.content?.sections) {
-        contentData.content.sections.forEach(section => {
-            html += `<h2>${section.heading}</h2>\n${section.content}\n\n`;
-            if (section.subsections) {
-                section.subsections.forEach(sub => {
-                    html += `<h3>${sub.subheading}</h3>\n${sub.content}\n\n`;
-                });
-            }
-        });
-    }
-
-    if (contentData.youtubeVideos) {
-        contentData.youtubeVideos.forEach(video => {
-            if (video.embedContext) html += `<p>${video.embedContext}</p>\n`;
-            html += `<div class="video-container">\n`;
-            html += `<iframe width="560" height="315" src="https://www.youtube.com/embed/${video.videoId}" `;
-            html += `frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>\n`;
-            html += `</div>\n\n`;
-        });
-    }
-
-    if (contentData.content?.faqSection) {
-        html += `<h2>Frequently Asked Questions</h2>\n\n`;
-        contentData.content.faqSection.forEach(faq => {
-            html += `<h3>${faq.question}</h3>\n<p>${faq.answer}</p>\n\n`;
-        });
-    }
-
-    if (contentData.content?.conclusion) html += contentData.content.conclusion + '\n\n';
-
-    if (contentData.externalReferences?.length > 0) {
-        html += `<h2>References</h2>\n<ol>\n`;
-        contentData.externalReferences.forEach(ref => {
-            html += `<li><a href="${ref.url}" target="_blank" rel="nofollow noopener">${ref.source}</a></li>\n`;
-        });
-        html += `</ol>\n`;
-    }
-
-    // ⚠️ CRITICAL: NO SCHEMA MARKUP IN CONTENT!
-    return html;
-}
 
 // ════════════════════════════════════════════════════════════════════════════════
 // WORD COUNT ENFORCEMENT (2,500-3,000 WORDS MANDATORY)
@@ -309,10 +230,11 @@ const extractJson = (text: string): string => {
     }
     
     // First, try a simple parse. If it's valid, we're done.
+// FIX: Ensure catch variables are typed as `any` to allow property access on them with strict compiler options.
     try {
         JSON.parse(text);
         return text;
-    } catch (e) { /* Not valid, proceed with cleaning */ }
+    } catch (e: any) { /* Not valid, proceed with cleaning */ }
 
     // Aggressively clean up common conversational text and markdown fences.
     let cleanedText = text
@@ -413,6 +335,37 @@ const extractJson = (text: string): string => {
     }
 };
 
+/**
+ * Strips markdown code fences and conversational text from AI-generated HTML snippets.
+ * Ensures that only raw, clean HTML is returned, preventing page distortion.
+ * @param rawHtml The raw string response from the AI.
+ * @returns A string containing only the HTML content.
+ */
+const sanitizeHtmlResponse = (rawHtml: string): string => {
+    if (!rawHtml || typeof rawHtml !== 'string') {
+        return '';
+    }
+    
+    // Remove markdown code fences for html, plain text, etc.
+    let cleanedHtml = rawHtml
+        .replace(/^```(?:html)?\s*/i, '') // Remove opening ```html or ```
+        .replace(/\s*```$/, '')           // Remove closing ```
+        .trim();
+
+    // In case the AI adds conversational text like "Here is the HTML for the section:"
+    // A simple heuristic is to find the first opening HTML tag and start from there.
+    const firstTagIndex = cleanedHtml.indexOf('<');
+    if (firstTagIndex > 0) {
+        // Check if the text before the tag is just whitespace or contains actual words.
+        const pretext = cleanedHtml.substring(0, firstTagIndex).trim();
+        if (pretext.length > 0 && pretext.length < 100) { // Avoid stripping large amounts of text by accident
+            console.warn(`[Sanitize HTML] Stripping potential boilerplate: "${pretext}"`);
+            cleanedHtml = cleanedHtml.substring(firstTagIndex);
+        }
+    }
+
+    return cleanedHtml;
+};
 
 /**
  * Extracts a YouTube video ID from various URL formats.
@@ -471,7 +424,6 @@ const extractSlugFromUrl = (urlString: string): string => {
  * @returns The result of the successful API call.
  * @throws {Error} if the call fails after all retries or on a non-retriable error.
  */
-// FIX: Changed catch parameter from `e: unknown` to `error: any` to allow direct property access and fix type errors.
 const callAiWithRetry = async (apiCall: () => Promise<any>, maxRetries = 5, initialDelay = 5000) => {
     for (let attempt = 0; attempt < maxRetries; attempt++) {
         try {
@@ -1010,7 +962,7 @@ type SitemapPage = {
     publishedState: string;
 };
 
-type GeneratedContent = {
+export type GeneratedContent = {
     title: string;
     slug: string;
     metaDescription: string;
@@ -1387,7 +1339,7 @@ const ProgressBar = memo(({ currentStep, onStepClick }: { currentStep: number; o
                             role="button"
                             tabIndex={0}
                         >
-                            <div className="step-circle">{status === 'completed' ? '✓' : stepIndex}</div>
+                            <div className="step-circle">{stepIndex}</div>
                             <span className="step-name">{name}</span>
                         </li>
                     );
@@ -1437,8 +1389,8 @@ const ApiKeyInput = memo(({ provider, value, onChange, status, name, placeholder
             <InputComponent {...commonProps} />
             <div className="key-status-icon" id={`${provider}-status`} role="status">
                 {status === 'validating' && <div className="key-status-spinner" aria-label="Validating key"></div>}
-                {status === 'valid' && <svg className="success" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" aria-label="Key is valid"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" /></svg>}
-                {status === 'invalid' && <svg className="error" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" aria-label="Key is invalid"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" /></svg>}
+                {status === 'valid' && <svg className="success" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg>}
+                {status === 'invalid' && <svg className="error" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="15" y1="9" x2="9" y2="15"></line><line x1="9" y1="9" x2="15" y2="15"></line></svg>}
             </div>
         </div>
     );
@@ -1449,9 +1401,9 @@ const SeoChecklist = memo(({ checks }: { checks: Record<string, SeoCheck> }) => 
         {Object.entries(checks).map(([key, check]) => (
             <li key={key} className={check.valid ? 'valid' : 'invalid'}>
                 {check.valid ? (
-                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" aria-label="Success"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" /></svg>
+                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg>
                 ) : (
-                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" aria-label="Error"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" /></svg>
+                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="15" y1="9" x2="9" y2="15"></line><line x1="9" y1="9" x2="15" y2="15"></line></svg>
                 )}
                 <span>{check.text}</span>
             </li>
@@ -2556,7 +2508,8 @@ const App = () => {
                 },
                 () => stopHealthAnalysisRef.current
             );
-        } catch(error) {
+// FIX: Ensure catch variables are typed as `any` to allow property access on them with strict compiler options.
+        } catch(error: any) {
             console.error("Content health analysis process was interrupted or failed:", error);
         } finally {
             setIsAnalyzingHealth(false);
@@ -3060,7 +3013,7 @@ const App = () => {
 
                 // --- STAGE 1: SERP & Keyword Intelligence ---
                 if (apiKeys.serperApiKey && apiKeyStatus.serper === 'valid') {
-                    dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Stage 1/4: Fetching SERP Data...' } });
+                    dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Stage 1/5: Fetching SERP Data...' } });
                     const cacheKey = `serp-${item.title}`;
                     const cachedSerp = apiCache.get(cacheKey);
 
@@ -3104,7 +3057,7 @@ const App = () => {
                     }
                 }
 
-                dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Stage 1/4: Analyzing Topic...' } });
+                dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Stage 1/5: Analyzing Topic...' } });
                 const skCacheKey = `sk-${item.title}`;
                 if (apiCache.get(skCacheKey)) {
                     semanticKeywords = apiCache.get(skCacheKey);
@@ -3118,12 +3071,19 @@ const App = () => {
                 if (stopGenerationRef.current.has(item.id)) break;
 
                 // --- STAGE 2: Generate Metadata and Outline ---
-                dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Stage 2/4: Generating Article Outline...' } });
+                dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Stage 2/5: Generating Article Outline...' } });
                 const outlineResponseText = await callAI('content_meta_and_outline', [item.title, semanticKeywords, serpData, existingPages, item.crawledContent]);
                 rawResponseForDebugging = outlineResponseText; // Save for debugging if JSON parse fails
                 const metaAndOutline = JSON.parse(extractJson(outlineResponseText));
 
+                // SOTA FIX: Sanitize the introduction and conclusion HTML that comes from the JSON payload.
+                // This is the root cause of the layout distortion, as the AI was wrapping these
+                // specific fields in markdown fences, which were not being stripped.
+                metaAndOutline.introduction = sanitizeHtmlResponse(metaAndOutline.introduction);
+                metaAndOutline.conclusion = sanitizeHtmlResponse(metaAndOutline.conclusion);
+
                 // --- STAGE 3: Generate Content Section-by-Section ---
+                const fullFaqData: { question: string, answer: string }[] = [];
                 let contentParts: string[] = [];
                 contentParts.push(metaAndOutline.introduction);
                 contentParts.push(`<h3>Key Takeaways</h3><ul>${metaAndOutline.keyTakeaways.map((li: string) => `<li>${li}</li>`).join('')}</ul>`);
@@ -3133,9 +3093,10 @@ const App = () => {
                 for (let i = 0; i < metaAndOutline.outline.length; i++) {
                     const heading = metaAndOutline.outline[i];
                     if (stopGenerationRef.current.has(item.id)) break;
-                    dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: `Stage 3/4: Writing Section ${i + 1}/${metaAndOutline.outline.length}` } });
+                    dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: `Stage 3/5: Writing Section ${i + 1}/${metaAndOutline.outline.length}` } });
                     
-                    const sectionHtml = await callAI('write_article_section', [item.title, metaAndOutline.title, heading, existingPages], 'html');
+                    const rawSectionHtml = await callAI('write_article_section', [item.title, metaAndOutline.title, heading, existingPages], 'html');
+                    const sectionHtml = sanitizeHtmlResponse(rawSectionHtml);
                     contentParts.push(`<h2>${heading}</h2>\n${sectionHtml}`);
 
                     if (i === 2 && youtubeVideos?.[0]) {
@@ -3155,7 +3116,16 @@ const App = () => {
                 contentParts.push(`<h2>Frequently Asked Questions</h2>`);
                 for (const faq of metaAndOutline.faqSection) {
                      if (stopGenerationRef.current.has(item.id)) break;
-                     const answerHtml = await callAI('write_faq_answer', [faq.question], 'html');
+                     const rawAnswerHtml = await callAI('write_faq_answer', [faq.question], 'html');
+                     const answerHtml = sanitizeHtmlResponse(rawAnswerHtml);
+                     
+                     const tempDiv = document.createElement('div');
+                     tempDiv.innerHTML = answerHtml;
+                     const answerText = tempDiv.textContent?.trim() || '';
+                     if (faq.question && answerText) {
+                        fullFaqData.push({ question: faq.question, answer: answerText });
+                     }
+                     
                      contentParts.push(`<h3>${faq.question}</h3>\n${answerHtml}`);
                 }
                 
@@ -3202,7 +3172,7 @@ const App = () => {
                     for (let i = 0; i < processedContent.imageDetails.length; i++) {
                         const imageDetail = processedContent.imageDetails[i];
                         if (stopGenerationRef.current.has(item.id)) break;
-                        dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: `Stage 4/4: Generating Image ${i + 1}/${processedContent.imageDetails.length}...` } });
+                        dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: `Stage 4/5: Generating Image ${i + 1}/${processedContent.imageDetails.length}...` } });
                         
                         const generatedImageSrc = await generateImageWithFallback(imageDetail.prompt);
                         
@@ -3224,8 +3194,13 @@ const App = () => {
                 }
 
                 if (stopGenerationRef.current.has(item.id)) break;
+                
+                // --- STAGE 5: Generate Schema Markup ---
+                dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Stage 5/5: Generating Schema...' } });
+                const schemaObject = generateFullSchema(processedContent, wpConfig, fullFaqData);
+                processedContent.jsonLdSchema = schemaObject;
 
-                dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Stage 4/4: Finalizing...' }});
+                dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Stage 5/5: Finalizing...' } });
                 dispatch({ type: 'SET_CONTENT', payload: { id: item.id, content: processedContent } });
 
             } catch (error: any) {
@@ -3246,7 +3221,7 @@ const App = () => {
         }
 
         setIsGenerating(false);
-    }, [apiKeys, apiKeyStatus, callAI, existingPages]);
+    }, [apiKeys, apiKeyStatus, callAI, existingPages, wpConfig]);
     
     // --- WordPress Publishing Logic ---
 
@@ -3296,6 +3271,9 @@ const App = () => {
         let content = itemToPublish.generatedContent.content;
         const authHeader = `Basic ${btoa(`${username}:${currentWpPassword}`)}`;
         const apiUrlBase = url.replace(/\/+$/, '') + '/wp-json/wp/v2';
+        
+        const schemaObject = itemToPublish.generatedContent.jsonLdSchema;
+        const schemaMarkup = schemaObject ? generateSchemaMarkup(schemaObject) : '';
 
         // 1. Upload images and replace base64 src with WordPress URLs
         try {
@@ -3348,7 +3326,6 @@ const App = () => {
                     }
                 }
             }
-// FIX: Changed catch parameter from `e: unknown` to `error: any` to allow direct property access and fix type errors.
         } catch (error: any) {
             if (error.name === 'TypeError' || error.message.toLowerCase().includes('cors')) {
                 return { success: false, message: getWpConnectionErrorHelp('CORS', error.message) };
@@ -3361,40 +3338,60 @@ const App = () => {
 
         // 2. Find Post ID for updates
         let postId: number | null = null;
+        let postTypeForUpdate: string = 'posts'; // Default to 'posts'
         if (isUpdate) {
-            try {
-                const slug = extractSlugFromUrl(itemToPublish.originalUrl!);
-                const postSearchResponse = await fetchWordPressWithRetry(`${apiUrlBase}/posts?slug=${slug}`, {
-                    method: 'GET',
-                    headers: { 'Authorization': authHeader }
-                });
-                 if (!postSearchResponse.ok) {
-                    const errorJson = await postSearchResponse.json().catch(() => ({}));
-                    throw new Error(errorJson.message || `Could not find existing post (HTTP ${postSearchResponse.status})`);
+            const slug = extractSlugFromUrl(itemToPublish.originalUrl!);
+            const postTypesToSearch = ['posts', 'pages']; // Common post types
+            let found = false;
+
+            for (const postType of postTypesToSearch) {
+                if (found) break;
+                try {
+                    // Search for any status (e.g., publish, draft, private)
+                    const searchUrl = `${apiUrlBase}/${postType}?slug=${slug}&status=any`;
+                    console.log(`[WP Publish] Searching for slug '${slug}' in post type '${postType}'...`);
+                    
+                    const postSearchResponse = await fetchWordPressWithRetry(searchUrl, {
+                        method: 'GET',
+                        headers: { 'Authorization': authHeader }
+                    });
+
+                    if (!postSearchResponse.ok) {
+                        console.warn(`[WP Publish] Search failed for post type '${postType}' with status ${postSearchResponse.status}.`);
+                        continue;
+                    }
+
+                    const posts = await postSearchResponse.json();
+                    if (posts.length > 0) {
+                        postId = posts[0].id;
+                        postTypeForUpdate = postType; // Store the correct post type ('posts' or 'pages')
+                        found = true;
+                        console.log(`[WP Publish] Found existing content with ID ${postId} in post type '${postType}'.`);
+                    }
+                } catch (error: any) {
+                     console.error(`[WP Publish] Error searching for existing post in '${postType}':`, error);
                 }
-                const posts = await postSearchResponse.json();
-                if (posts.length > 0) {
-                    postId = posts[0].id;
-                } else {
-                    console.warn(`Could not find existing post with slug "${slug}". A new post will be created.`);
-                }
-// FIX: Changed catch parameter from `e: unknown` to `error: any` to allow direct property access and fix type errors.
-            } catch (error: any) {
-                return { success: false, message: `Failed to find original post: ${error.message}` };
+            }
+
+            if (!found) {
+                console.warn(`[WP Publish] Could not find existing post or page with slug "${slug}". A new post will be created.`);
             }
         }
+
 
         // 3. Prepare post data
         const postData = {
             title: itemToPublish.generatedContent.title,
-            content: content,
+            content: content + '\n\n' + schemaMarkup,
             status: 'publish',
             slug: itemToPublish.generatedContent.slug,
             excerpt: itemToPublish.generatedContent.metaDescription
         };
 
         // 4. Create or Update Post
-        const endpoint = postId ? `${apiUrlBase}/posts/${postId}` : `${apiUrlBase}/posts`;
+        // Use the discovered post type for updates. Default to 'posts' for new content.
+        const endpoint = postId ? `${apiUrlBase}/${postTypeForUpdate}/${postId}` : `${apiUrlBase}/posts`;
+        console.log(`[WP Publish] Using endpoint: ${endpoint}`);
         try {
             const response = await fetchWordPressWithRetry(endpoint, {
                 method: 'POST',
@@ -3420,7 +3417,6 @@ const App = () => {
             );
 
             return { success: true, message: message, link: responseJson.link };
-// FIX: Changed catch parameter from `e: unknown` to `error: any` to allow direct property access and fix type errors.
         } catch (error: any) {
              if (error.name === 'TypeError' || error.message.toLowerCase().includes('cors')) {
                 return { success: false, message: getWpConnectionErrorHelp('CORS', error.message) };
@@ -3547,36 +3543,40 @@ const App = () => {
     };
 
     const calculateGenerationProgress = (statusText: string): string => {
-        if (statusText.includes("Stage 1/4")) return "10%";
-        if (statusText.includes("Stage 2/4")) return "25%";
-        if (statusText.includes("Stage 3/4")) {
+        if (statusText.includes("Stage 1/5")) return "5%";
+        if (statusText.includes("Stage 2/5")) return "15%";
+        if (statusText.includes("Stage 3/5")) {
             const match = statusText.match(/Writing Section (\d+)\/(\d+)/);
             if (match) {
                 const current = parseInt(match[1], 10);
                 const total = parseInt(match[2], 10);
                 if (total > 0) {
-                    // Stage 3 is from 25% to 75%
-                    return `${25 + (current / total) * 50}%`;
+                    // Stage 3 is from 15% to 70% (55% range)
+                    return `${15 + (current / total) * 55}%`;
                 }
             }
-            return "50%";
+            return "45%";
         }
-        if (statusText.includes("Stage 4/4")) {
+        if (statusText.includes("Stage 4/5")) {
              if (statusText.includes("Generating Image")) {
                 const match = statusText.match(/Image (\d+)\/(\d+)/);
                  if (match) {
                     const current = parseInt(match[1], 10);
                     const total = parseInt(match[2], 10);
                     if (total > 0) {
-                        // Stage 4 is from 75% to 100%
-                        return `${75 + (current / total) * 25}%`;
+                        // Stage 4 is from 70% to 90% (20% range)
+                        return `${70 + (current / total) * 20}%`;
                     }
                  }
              }
-            if (statusText.includes("Finalizing")) return "99%";
-            return "75%";
+            return "70%";
         }
-        return "5%";
+        if (statusText.includes("Stage 5/5")) {
+            if (statusText.includes("Generating Schema")) return "90%";
+            if (statusText.includes("Finalizing")) return "99%";
+            return "90%";
+        }
+        return "2%";
     };
 
 
@@ -3894,9 +3894,9 @@ const App = () => {
                                     {wpConnectionMessage &&
                                         <div className={`wp-connection-status ${wpConnectionStatus}`}>
                                             {wpConnectionStatus === 'verifying' && <div className="spinner"></div>}
-                                            {wpConnectionStatus === 'valid' && <svg className="success" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" /></svg>}
-                                            {wpConnectionStatus === 'invalid' && <svg className="error" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" /></svg>}
-                                            <div className={wpConnectionStatus === 'valid' ? 'success' : 'error'}>{wpConnectionMessage}</div>
+                                            {wpConnectionStatus === 'valid' && <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg>}
+                                            {wpConnectionStatus === 'invalid' && <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="15" y1="9" x2="9" y2="15"></line><line x1="9" y1="9" x2="15" y2="15"></line></svg>}
+                                            <div className="message-content">{wpConnectionMessage}</div>
                                         </div>
                                     }
                                 </div>
